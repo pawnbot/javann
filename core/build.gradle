@@ -1,0 +1,7 @@
+jar {
+    manifest {
+        attributes 'Implementation-Title': 'javann',
+                'Implementation-Version': '1.0'
+    }
+    baseName 'javann'
+}
