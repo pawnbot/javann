@@ -8,6 +8,7 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.DoubleSummaryStatistics;
 import java.util.Random;
 
 import net.javann.util.ValueLabel;
@@ -17,97 +18,117 @@ import net.javann.util.MetricFunction;
 public class NeuralNetwork implements Serializable {
 
 	// serialver for backwards compatibility
-	private static final long serialVersionUID = 1L;
+	private static final long serialVersionUID = 2L;
 	// the random number generator
-	private final Random random = new Random();
+	private final Random random;
 
+	private double velocityMultiplier;
+	private double momentumMultiplier;
 	private double learningRate;
 	private double l1Multiplier;
 	private double l2Multiplier;
-	private double activeUnitsRatio;
+	private double dropoutRate;
 	private int miniBatchSize;
 	LossFunction lossFunction;
 	MetricFunction[] loggedMetrics;
-	boolean useSoftMax;
 
+	int numInputs;
+	int numOutputs;
 	private double[][][] weights;
 	private double[][] biases;
 	private double[][] activations;
 
 	private Bucketizer bucketizer;
 
-	private double[][][] tmpNablaW;
-	private double[][] tmpNablaB;
+	private double[][][] newNablaW;
+	private double[][] newNablaB;
+	private double[][][] oldNablaW;
+	private double[][] oldNablaB;
 
-
-	/**
-	 * Builds a neural network with the given number of input units, hidden
-	 * units, and output units.
-	 * 
-	 * @param structure
-	 *            Structure of NN
-	 */
 	public NeuralNetwork(int[] structure) {
+		random = new Random();
+		velocityMultiplier = 0.;
+		momentumMultiplier = 0.;
 		learningRate = 1.E-2;
-		l1Multiplier = 1.E-7;
-		l2Multiplier = 1.E-7;
-		activeUnitsRatio = 1.;
-		miniBatchSize = 100;
+		l1Multiplier = 1.E-6;
+		l2Multiplier = 1.E-5;
+		dropoutRate = 0.;
+		miniBatchSize = 10;
 		lossFunction = LossFunction.SQUARED_ERROR;
 		loggedMetrics = null;
-		int lastLayer = structure.length - 1;
-		useSoftMax = (structure[lastLayer] > 1) && structure[lastLayer] == structure[lastLayer - 1];
 
+		numInputs = structure[0];
+		numOutputs = structure[structure.length - 1];
 		weights = new double[structure.length - 1][][];
 		biases = new double[structure.length - 1][];
 		activations = new double[weights.length][];
 		for (int depth = 0; depth < weights.length; ++depth) {
-			weights[depth] = new double [structure[1 + depth]][];
-			biases[depth] = new double [structure[1 + depth]];
-			activations[depth] = new double[structure[1 + depth]];
+			if (depth + 1 < weights.length) {
+				// ReLu layers
+				weights[depth] = new double[structure[depth + 1]][];
+				biases[depth] = new double[structure[depth + 1]];
+				activations[depth] = new double[structure[1 + depth]];
+			} else {
+				// SoftMax layer
+				weights[depth] = new double[structure[depth]][];
+				biases[depth] = new double[structure[depth]];
+				activations[depth] = new double[structure[depth]];
+			}
 			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-				weights[depth][unitId] = new double [structure[depth]];
+				if (depth + 1 < weights.length) {
+					// ReLu layers
+					weights[depth][unitId] = new double[structure[depth]];
+				} else {
+					// SoftMax Layer
+					weights[depth][unitId] = new double[1];
+				}
 			}
 		}
 		randomizeWeights();
 
 		bucketizer = new Bucketizer();
 
-		tmpNablaW = null;
-		tmpNablaB = null;
+		newNablaW = null;
+		newNablaB = null;
+		oldNablaW = null;
+		oldNablaB = null;
 	}
 
 	private double[] feedForward(double[] inputLayer, double activeRatio) {
-		for (int depth = 0; depth < weights.length; ++depth) {
+		for (int depth = 0; depth + 1 < weights.length; ++depth) {
 			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-				if (depth < weights.length - 1) {
-					double activeRatioForLayer = 1.;
-					if (activeRatio < 1.0 && weights[depth].length > 10) {
-						activeRatioForLayer = activeRatio;
-					}
-					if (activeRatioForLayer < 1. && activeRatioForLayer < random.nextDouble()) {
-						activations[depth][unitId] = 0.;
-						continue;
-					}
-					// Intermediate layers, using ReLu
-					double dotProduct = biases[depth][unitId];
-					if (depth > 0) {
-						dotProduct += innerProduct(weights[depth][unitId].length, weights[depth][unitId], activations[depth - 1]);
-					} else {
-						dotProduct += innerProduct(weights[depth][unitId].length, weights[depth][unitId], inputLayer);
-					}
-					activations[depth][unitId] = relu(dotProduct) / activeRatioForLayer;
+				// Intermediate layers, using ReLu
+				if (activeRatio < 1.0 && depth + 2 < weights.length && activeRatio < random.nextDouble()) {
+					// Don't disable neurons right before SoftMax
+					activations[depth][unitId] = 0.;
+					continue;
+				}
+				double dotProduct = biases[depth][unitId];
+				if (depth > 0) {
+					dotProduct += innerProduct(weights[depth][unitId].length, weights[depth][unitId], activations[depth - 1]);
 				} else {
-					if (useSoftMax) {
-						activations[depth][unitId] = softMax(biases[depth][unitId], weights[depth][unitId], activations[depth - 1], unitId);
-					} else {
-						double dotProduct = biases[depth][unitId] + innerProduct(weights[depth][unitId].length, weights[depth][unitId], activations[depth - 1]);
-						activations[depth][unitId] = sigmoid(dotProduct);
-					}
+					dotProduct += innerProduct(weights[depth][unitId].length, weights[depth][unitId], inputLayer);
+				}
+				activations[depth][unitId] = relu(dotProduct);
+				if (activeRatio < 1.0 && depth + 2 < weights.length) {
+					activations[depth][unitId] /= activeRatio;
 				}
 			}
 		}
-		return activations[activations.length - 1];
+		int lastLayer = weights.length - 1;
+		double sumExponents = softMaxDenominator(activations[lastLayer - 1]);
+		for (int unitId = 0; unitId < activations[lastLayer].length; ++unitId) {
+			if (sumExponents != Double.POSITIVE_INFINITY) {
+				activations[lastLayer][unitId] = softMaxNumerator(activations[lastLayer - 1], unitId) / sumExponents;
+			} else {
+				if (Math.abs(activations[lastLayer - 1][unitId]) > Bucketizer.EPSILON) {
+					activations[lastLayer][unitId] = 1.;
+				} else {
+					activations[lastLayer][unitId] = 0.;
+				}
+			}
+		}
+		return activations[lastLayer];
 	}
 
 
@@ -122,92 +143,88 @@ public class NeuralNetwork implements Serializable {
 			}
 		}
 
-		feedForward(inputLayer, activeUnitsRatio);
+		feedForward(inputLayer, 1. - dropoutRate);
 		int lastLayer = weights.length - 1;
-		int numOutputs = weights[lastLayer].length;
-		for (int unitId = 0; unitId < numOutputs; ++unitId) {
-			double derivative;
-			if (useSoftMax) {
-				derivative = softMaxDerivative(biases[lastLayer][unitId], weights[lastLayer][unitId], activations[lastLayer - 1], unitId, unitId, activations[lastLayer][unitId]);
+		double expectedAfterNumOutputs = 0.;
+		for (int unitId = 0; unitId < weights[lastLayer].length; ++unitId) {
+			if (unitId < numOutputs) {
+				expectedAfterNumOutputs += Math.abs(expectedOutputLayer[unitId]) > Bucketizer.EPSILON ? 1. : 0.;
 			} else {
-				derivative = sigmoidDerivative(activations[lastLayer][unitId]);
+				expectedAfterNumOutputs = (1. - expectedAfterNumOutputs) / (weights[lastLayer].length - numOutputs);
 			}
-			double errorDerivative = 0.;
-			if (lossFunction == LossFunction.SQUARED_ERROR) {
-				errorDerivative = 2. * (activations[lastLayer][unitId] - expectedOutputLayer[unitId]);
+		}
+		for (int unitId = 0; unitId < weights[lastLayer].length; ++unitId) {
+			double expectedOutput;
+			if (unitId < numOutputs) {
+				expectedOutput = expectedOutputLayer[unitId];
+			} else {
+				expectedOutput = expectedAfterNumOutputs;
 			}
-			if (lossFunction == LossFunction.LOG_LOSS) {
-				if (expectedOutputLayer[unitId] < 0.5) {
-					errorDerivative = 1. / (1. - activations[lastLayer][unitId]);
-				} else {
-					errorDerivative = -1. / activations[lastLayer][unitId];
-				}
+			double expectedProb = Math.abs(expectedOutput) > Bucketizer.EPSILON ? 1. : 0.;
+
+			double derivative = 0.;
+			if (lossFunction == LossFunction.NORMALIZED_ENTROPY) {
+				derivative = activations[lastLayer][unitId] - expectedProb;
+			} else if (lossFunction == LossFunction.CUMULATIVE_REWARD) {
+				derivative = -expectedOutput * activations[lastLayer][unitId] * (1. - activations[lastLayer][unitId]);
+			} else if (lossFunction == LossFunction.SQUARED_ERROR)
+			{
+				derivative = 2. * (activations[lastLayer][unitId] - expectedOutput);
+				derivative *= activations[lastLayer][unitId] * (1. - activations[lastLayer][unitId]);
 			}
-			if (lossFunction == LossFunction.REINFORCEMENT_LEARNING) {
-				errorDerivative = -expectedOutputLayer[unitId];
+
+			if (Double.isNaN(derivative)) {
+				System.out.println("Activation: " + activations[lastLayer][unitId]);
+				System.out.println("Prob: " + expectedProb);
+				System.exit(0);
 			}
-			nablaB[lastLayer][unitId] = errorDerivative * derivative;
-			// L2 regularization
-			nablaB[lastLayer][unitId] += 2 * biases[lastLayer][unitId] * l2Multiplier;
-			// L1 regularization
-			nablaB[lastLayer][unitId] += biases[lastLayer][unitId] > 0. ? l1Multiplier : -l1Multiplier;
-			for (int inputId = 0; inputId < weights[lastLayer][unitId].length; ++inputId) {
-				if (useSoftMax) {
-					derivative = softMaxDerivative(biases[lastLayer][unitId], weights[lastLayer][unitId], activations[lastLayer - 1], unitId, inputId, activations[lastLayer][unitId]);
-				}
-				nablaW[lastLayer][unitId][inputId] = errorDerivative * derivative * activations[lastLayer - 1][inputId];
-				// L2 regularization
-				nablaW[lastLayer][unitId][inputId] += 2 * weights[lastLayer][unitId][inputId] * l2Multiplier;
-				// L1 regularization
-				nablaW[lastLayer][unitId][inputId] += weights[lastLayer][unitId][inputId] > 0. ? l1Multiplier : -l1Multiplier;
-			}
+
+			nablaB[lastLayer][unitId] = derivative;
+			nablaW[lastLayer][unitId][0] = derivative * activations[lastLayer - 1][unitId];
 		}
 		for (int depth = lastLayer - 1; depth >= 0; --depth) {
 			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				if (activations[depth][unitId] == 0.)
+					continue;
 				double delta = 0.;
-				for (int id = 0; id < nablaB[depth + 1].length; ++id) {
-					delta += nablaB[depth + 1][id] * weights[depth + 1][id][unitId];
+				if (depth + 1 != lastLayer) {
+					for (int id = 0; id < nablaB[depth + 1].length; ++id) {
+						delta += nablaB[depth + 1][id] * weights[depth + 1][id][unitId];
+					}
+				} else {
+					delta = nablaB[depth + 1][unitId] * weights[depth + 1][unitId][0];
 				}
 				delta *= reluDerivative(activations[depth][unitId]);
 				nablaB[depth][unitId] = delta;
-				// L2 regularization
-				nablaB[depth][unitId] += 2 * biases[depth][unitId] * l2Multiplier;
-				// L1 regularization
-				nablaB[depth][unitId] += biases[depth][unitId] > 0. ? l1Multiplier : -l1Multiplier;
 				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
 					if (depth > 0) {
 						nablaW[depth][unitId][inputId] = delta * activations[depth - 1][inputId];
 					} else {
 						nablaW[depth][unitId][inputId] = delta * inputLayer[inputId];
 					}
-					// L2 regularization
-					nablaW[depth][unitId][inputId] += 2 * weights[depth][unitId][inputId] * l2Multiplier;
-					// L1 regularization
-					nablaW[depth][unitId][inputId] += weights[depth][unitId][inputId] > 0. ? l1Multiplier : -l1Multiplier;
 				}
 			}
 		}
 
-		if (tmpNablaB != null && tmpNablaW != null) {
-			applyNablasToNN(nablaB, nablaW, learningRate);
-		} else {
-			for (int depth = 0; depth < weights.length; ++depth) {
-				for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-					tmpNablaB[depth][unitId] += learningRate * nablaB[depth][unitId];
-					for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
-						tmpNablaW[depth][unitId][inputId] += learningRate * nablaW[depth][unitId][inputId];
-					}
+		for (int depth = 0; depth < weights.length; ++depth) {
+			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				newNablaB[depth][unitId] += nablaB[depth][unitId];
+				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+					newNablaW[depth][unitId][inputId] += nablaW[depth][unitId][inputId];
+					// Adding L1 & L2 regularization
+					newNablaW[depth][unitId][inputId] += l2Multiplier * weights[depth][unitId][inputId];
+					newNablaW[depth][unitId][inputId] += l1Multiplier * Math.signum(weights[depth][unitId][inputId]);
 				}
 			}
 		}
 	}
 
 	public void feedData(double[][] data, double[][] labels, int numEpochs) {
-		if (!bucketizer.isInitilized()) {
+		if (!bucketizer.isInitialized()) {
 			bucketizer.feedData(data, labels);
 		}
 		if (loggedMetrics.length > 0) {
-			logResults(-1, data, labels);
+			logResults(0, data, labels);
 		}
 		double[][] inputs = new double[data.length][];
 		double[][] outputs = new double[labels.length][];
@@ -215,55 +232,72 @@ public class NeuralNetwork implements Serializable {
 		for (int id = 0; id < data.length; ++id) {
 			randomIndexes[id] = id;
 			inputs[id] = bucketizer.exampleToInput(data[id]);
-			if (lossFunction != LossFunction.REINFORCEMENT_LEARNING) {
+			if (lossFunction != LossFunction.CUMULATIVE_REWARD) {
 				outputs[id] = bucketizer.labelsToOutput(labels[id]);
 			} else {
 				outputs[id] = labels[id];
 			}
 		}
+		double velocity = 0.;
+		double momentum;
+		double adaptiveLearningRate = learningRate;
 		for (int epoch = 0; epoch < numEpochs; ++epoch) {
 			shuffleArray(randomIndexes);
 			for (int batchOffset = 0; batchOffset < data.length; batchOffset += miniBatchSize) {
-				tmpNablaB = new double[weights.length][];
-				tmpNablaW = new double[weights.length][][];
+				newNablaB = new double[weights.length][];
+				newNablaW = new double[weights.length][][];
 				for (int depth = 0; depth < weights.length; ++depth) {
-					tmpNablaB[depth] = new double[weights[depth].length];
-					tmpNablaW[depth] = new double[weights[depth].length][];
+					newNablaB[depth] = new double[weights[depth].length];
+					newNablaW[depth] = new double[weights[depth].length][];
 					for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-						tmpNablaW[depth][unitId] = new double[weights[depth][unitId].length];
+						newNablaW[depth][unitId] = new double[weights[depth][unitId].length];
 					}
 				}
-				int batchSize = Math.min(batchOffset + miniBatchSize, data.length) - batchOffset;
+				int batchSize = Math.min(miniBatchSize, data.length - batchOffset);
 				for (int id = 0; id < batchSize; ++id) {
 					backPropagation(inputs[randomIndexes[batchOffset + id]], outputs[randomIndexes[batchOffset + id]]);
 				}
-				applyNablasToNN(tmpNablaB, tmpNablaW, 1. / batchSize);
-				tmpNablaB = null;
-				tmpNablaW = null;
+				if (batchSize > 1) {
+					scaleNablas(newNablaB, newNablaW, 1. / batchSize);
+				}
+				applyNablasToNN(newNablaB, newNablaW, learningRate);
+				rescaleExplodedUnits();
+				momentum = velocity;
+				velocity = nablasInnerProduct();
+				adaptiveLearningRate += velocityMultiplier * velocity + momentumMultiplier * momentum;
+				oldNablaB = newNablaB;
+				oldNablaW = newNablaW;
+				newNablaB = null;
+				newNablaW = null;
 			}
 			if (loggedMetrics.length > 0) {
-				logResults(epoch, data, labels);
+				logResults(1 + epoch, data, labels);
 			}
 		}
+		oldNablaB = null;
+		oldNablaW = null;
 	}
 
 	public void feedData(TrainingData data, int numEpochs) {
 		feedData(data.getFeatures(), data.getLabels(), numEpochs);
 	}
 
-	public double[] predictLabels(double[] example) {
+	public double[] genProbabilities(double[] example) {
 		double[] activations = feedForward(bucketizer.exampleToInput(example), 1.);
-		if (lossFunction != LossFunction.REINFORCEMENT_LEARNING) {
-			return bucketizer.outputToPredictions(activations);
-		} else {
-			return activations;
+		double[] labels = new double[numOutputs];
+		for (int labelId = 0; labelId < numOutputs; ++labelId) {
+			labels[labelId] = activations[labelId];
 		}
+		return labels;
+	}
+	public double[] genLabels(double[] example) {
+		return bucketizer.outputToPredictions(genProbabilities((example)));
 	}
 
 	public double getRMSE(double[][] data, double[][] labels) {
 		double rmse = 0.;
 		for (int id = 0; id < data.length; ++id) {
-			double[] predictions = predictLabels(data[id]);
+			double[] predictions = genLabels(data[id]);
 			for (int labelId = 0; labelId < labels[id].length; ++labelId) {
 				rmse += (predictions[labelId] - labels[id][labelId]) * (predictions[labelId] - labels[id][labelId]);
 			}
@@ -273,29 +307,33 @@ public class NeuralNetwork implements Serializable {
 	}
 
 	public double getAUC(double[][] data, double[][] labels) {
-		ArrayList<ValueLabel> auc = new ArrayList<>();
-		for (int id = 0; id < data.length; ++id) {
-			double[] predictions = predictLabels(data[id]);
-			auc.add(new ValueLabel(predictions[0], labels[id][0]));
-		}
-		Collections.sort(auc);
-		double area = 0.;
-		int height = 0;
-		for (int id = 0; id < auc.size(); ++id) {
-			if (auc.get(id).label < 0.5) {
-				height++;
-			} else {
-				area += height;
+		double result = 0.;
+		for (int labelId = 0; labelId < numOutputs; ++labelId) {
+			ArrayList<ValueLabel> auc = new ArrayList<>();
+			for (int id = 0; id < data.length; ++id) {
+				double[] predictions = genLabels(data[id]);
+				auc.add(new ValueLabel(predictions[labelId], labels[id][labelId]));
 			}
+			Collections.sort(auc);
+			double area = 0.;
+			int height = 0;
+			for (int id = 0; id < auc.size(); ++id) {
+				if (auc.get(id).label[0] < bucketizer.EPSILON) {
+					height++;
+				} else {
+					area += height;
+				}
+			}
+			result +=  area / (height + Bucketizer.EPSILON) / (auc.size() - height + Bucketizer.EPSILON);
 		}
-		return area / (height + Bucketizer.EPSILON) / (auc.size() - height + Bucketizer.EPSILON);
+		return  result / numOutputs;
 	}
 
 	public double getCalibration(double[][] data, double[][] labels) {
 		double prediction = 0.;
 		double observed = 0.;
 		for (int id = 0; id < data.length; ++id) {
-			double[] predictions = predictLabels(data[id]);
+			double[] predictions = genLabels(data[id]);
 			for (int labelId = 0; labelId < labels[id].length; ++labelId) {
 				prediction += predictions[labelId];
 				observed += labels[id][labelId];
@@ -305,18 +343,27 @@ public class NeuralNetwork implements Serializable {
 	}
 
 	public double getNormalizedEntropy(double[][] data, double[][] labels) {
-		double ctr = 0.;
+		double[] ctr = new double [numOutputs];
 		for (int id = 0; id < labels.length; ++id) {
-			ctr += labels[id][0];
+			for (int labelId = 0; labelId < numOutputs; ++labelId) {
+				ctr[labelId] += Math.abs(labels[id][labelId]) > Bucketizer.EPSILON ? 1. : 0.;
+			}
 		}
-		ctr /= labels.length;
+		for (int labelId = 0; labelId < numOutputs; ++labelId) {
+			ctr[labelId] /= labels.length;
+		}
 		double loss = 0.;
 		double constantLoss = 0.;
 		for (int id = 0; id < data.length; ++id) {
-			double[] predictions = predictLabels(data[id]);
+			double[] predictions = genProbabilities(data[id]);
 			for (int labelId = 0; labelId < labels[id].length; ++labelId) {
-				loss += labels[id][labelId] * Math.log(predictions[labelId] + Bucketizer.EPSILON) + (1 - labels[id][labelId]) * Math.log(1. - predictions[labelId] + Bucketizer.EPSILON);
-				constantLoss += labels[id][labelId] * Math.log(ctr + Bucketizer.EPSILON) + (1 - labels[id][labelId]) * Math.log(1. - ctr + Bucketizer.EPSILON);
+				double label = Math.abs(labels[id][labelId]) > Bucketizer.EPSILON ? 1. : 0.;
+				loss += label * Math.log(predictions[labelId]);
+				constantLoss += label * Math.log(ctr[labelId]);
+				if (numOutputs == 1) {
+					loss += (1. - label) * Math.log(1. - predictions[labelId]);
+					constantLoss += (1. - label) * Math.log(1. - ctr[labelId]);
+				}
 			}
 		}
 		return loss / constantLoss;
@@ -325,7 +372,7 @@ public class NeuralNetwork implements Serializable {
 	public double getCumulativeReward(double[][] data, double[][] labels) {
 		double totalReward = 0.;
 		for (int id = 0; id < data.length; ++id) {
-			double[] predictions = feedForward(bucketizer.exampleToInput(data[id]), 1.);
+			double[] predictions = genProbabilities(data[id]);
 			for (int labelId = 0; labelId < labels[id].length; ++labelId) {
 				totalReward += labels[id][labelId] * predictions[labelId];
 			}
@@ -369,6 +416,10 @@ public class NeuralNetwork implements Serializable {
 		return bucketizer;
 	}
 
+	public void setBucketizer(Bucketizer bucketizer) {
+		this.bucketizer = bucketizer;
+	}
+
 	public double getLearningRate() {
 		return learningRate;
 	}
@@ -393,12 +444,12 @@ public class NeuralNetwork implements Serializable {
 		this.l2Multiplier = l2Multiplier;
 	}
 
-	public double getActiveUnitsRatio() {
-		return activeUnitsRatio;
+	public double getDropoutRate() {
+		return dropoutRate;
 	}
 
-	public void setActiveUnitsRatio(double activeUnitsRatio) {
-		this.activeUnitsRatio = activeUnitsRatio;
+	public void setDropoutRate(double dropoutRate) {
+		this.dropoutRate = dropoutRate;
 	}
 
 	public int getMiniBatchSize() { return miniBatchSize; }
@@ -420,6 +471,8 @@ public class NeuralNetwork implements Serializable {
 	}
 
 	private void logResults(int epochId, double[][] data, double[][] labels) {
+		if (loggedMetrics == null)
+			return;
 		String message = "Epoch: " + epochId;
 		for (int id = 0; id < loggedMetrics.length; ++id) {
 			message += ", " + loggedMetrics[id].toString() + ": ";
@@ -449,25 +502,105 @@ public class NeuralNetwork implements Serializable {
 	}
 
 	public void randomizeWeights() {
+		for (int depth = 0; depth + 1 < weights.length; ++depth) {
+			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				biases[depth][unitId] = 0.;
+				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+					weights[depth][unitId][inputId] = random.nextDouble() - 0.5;
+					weights[depth][unitId][inputId] *= Math.sqrt(2. / weights[depth][unitId].length);
+				}
+			}
+		}
+		int lastLayer = weights.length - 1;
+		for (int unitId = 0; unitId < weights[lastLayer].length; ++unitId) {
+			biases[lastLayer][unitId] = 0.;
+			weights[lastLayer][unitId][0] = 1.;
+		}
+	}
+
+	private void applyNablasToNN(double[][] nablaB, double[][][] nablaW, double rate) {
+		boolean shito = false;
 		for (int depth = 0; depth < weights.length; ++depth) {
 			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-				biases[depth][unitId] = 1.;
+				if (Double.isNaN(biases[depth][unitId])) {
+					System.out.println("Depth: " + depth +", UnitId: " + unitId + ", Bias: " + biases[depth][unitId]);
+					shito = true;
+				}
+				if (Double.isNaN(nablaB[depth][unitId])) {
+					System.out.println("Depth: " + depth +", UnitId: " + unitId + ", nablaB: " + nablaB[depth][unitId]);
+					shito = true;
+				}
+				biases[depth][unitId] -= rate * nablaB[depth][unitId];
 				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
-					weights[depth][unitId][inputId] = (2 * random.nextDouble() - 1.) / weights[depth][unitId].length;
+					if (Double.isNaN(weights[depth][unitId][inputId])) {
+						System.out.println("Depth: " + depth +", UnitId: " + unitId + ", Weight: " + weights[depth][unitId][inputId]);
+						shito = true;
+					}
+					if (Double.isNaN(nablaB[depth][unitId])) {
+						System.out.println("Depth: " + depth +", UnitId: " + unitId + ", nablaW: " + nablaW[depth][unitId][inputId]);
+						shito = true;
+					}
+					weights[depth][unitId][inputId] -= rate * nablaW[depth][unitId][inputId];
+				}
+			}
+		}
+		if (shito)
+			System.exit(0);
+	}
+	private void scaleNablas(double[][] nablaB, double[][][] nablaW, double scale) {
+		for (int depth = 0; depth < weights.length; ++depth) {
+			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				nablaB[depth][unitId] *= scale;
+				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+					nablaW[depth][unitId][inputId] *= scale;
+				}
+			}
+		}
+	}
+	private double nablasInnerProduct() {
+		if (oldNablaB == null || oldNablaW == null || newNablaB == null || newNablaW == null) {
+			return 0.;
+		}
+		double result = 0.;
+		for (int depth = 0; depth < weights.length; ++depth) {
+			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				result += oldNablaB[depth][unitId] * newNablaB[depth][unitId];
+				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+					result += oldNablaW[depth][unitId][inputId] * newNablaW[depth][unitId][inputId];
+				}
+			}
+		}
+		return result;
+	}
+	private void rescaleExplodedUnits() {
+		for (int depth = 0; depth + 1 < weights.length; ++depth) {
+			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
+				double l2norm = biases[depth][unitId] * biases[depth][unitId];
+				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+					l2norm += weights[depth][unitId][inputId] * weights[depth][unitId][inputId];
+				}
+				double scale = 3. / Math.sqrt(l2norm);
+				if (scale < 1. - bucketizer.EPSILON) {
+					biases[depth][unitId] *= scale;
+					for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
+						weights[depth][unitId][inputId] *= scale;
+					}
 				}
 			}
 		}
 	}
 
-	private void applyNablasToNN(double[][] nablaB, double[][][] nablaW, double rate) {
-		for (int depth = 0; depth < weights.length; ++depth) {
-			for (int unitId = 0; unitId < weights[depth].length; ++unitId) {
-				biases[depth][unitId] -= rate * nablaB[depth][unitId];
-				for (int inputId = 0; inputId < weights[depth][unitId].length; ++inputId) {
-					weights[depth][unitId][inputId] -= rate * nablaW[depth][unitId][inputId];
-				}
-			}
+	private double softMaxDenominator(double[] input) {
+		int lastLayer = weights.length - 1;
+		double expSum = 0.;
+		for (int unitId = 0; unitId < weights[lastLayer].length; ++unitId) {
+			expSum += Math.exp(biases[lastLayer][unitId] + weights[lastLayer][unitId][0] * input[unitId]);
 		}
+		return expSum;
+	}
+	private double softMaxNumerator(double[] input, int unitId) {
+		int lastLayer = weights.length - 1;
+		return Math.exp(biases[lastLayer][unitId] + weights[lastLayer][unitId][0] * input[unitId]);
 	}
 
 	private double innerProduct(int size, double[] weights, double[] input) {
@@ -476,38 +609,12 @@ public class NeuralNetwork implements Serializable {
 			result += weights[id] * input[id];
 		return result;
 	}
-	private double softMax(double bias, double[] weights, double[] input, int outputId) {
-		double value = Math.exp(bias + weights[outputId] * input[outputId]);
-		double valueSum = 0.;
-		for (int parentId = 0; parentId < weights.length; ++parentId) {
-			if (parentId != outputId) {
-				valueSum += Math.exp(-weights[parentId] * input[parentId]);
-			} else {
-				valueSum += value;
-			}
-		}
-		return value / valueSum;
-	}
-	private double softMaxDerivative(double bias, double[] weights, double[] input, int outputId, int nablaId, double activation) {
-		if (outputId == nablaId) {
-			return activation * (1. - activation);
-		} else {
-			return activation * softMax(bias, weights, input, nablaId);
-		}
-	}
-	private double sigmoid(double input) {
-		return 1. / (1. + Math.exp(-input));
-	}
-	private double sigmoidDerivative(double activation) {
-		return activation * (1. - activation);
-	}
 	private double relu(double input) {
 		return input > 0. ? input : 0.;
 	}
 	private double reluDerivative(double activation) {
 		return activation > 0. ? 1. : 0.;
 	}
-
 	private void shuffleArray(int[] array)
 	{
 		int index;
@@ -523,12 +630,6 @@ public class NeuralNetwork implements Serializable {
 		}
 	}
 
-	/**
-	 * Method which reads and returns a network from the given file
-	 *
-	 * @param filename
-	 *            The file to read from
-	 */
 	public static NeuralNetwork readFrom(String filename) throws IOException, ClassNotFoundException {
 		ObjectInputStream ois = new ObjectInputStream(new FileInputStream(filename));
 		NeuralNetwork net = (NeuralNetwork) ois.readObject();
@@ -537,12 +638,6 @@ public class NeuralNetwork implements Serializable {
 		return net;
 	}
 
-	/**
-	 * Method which writes this network to the given file
-	 *
-	 * @param filename
-	 *            The file to write to
-	 */
 	public void writeTo(String filename) throws IOException {
 		ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filename));
 		oos.writeObject(this);

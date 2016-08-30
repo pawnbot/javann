@@ -3,6 +3,7 @@ package net.javann.core;
 import java.io.*;
 
 import java.util.ArrayList;
+import java.util.DoubleSummaryStatistics;
 
 public class TrainingData implements Serializable, Cloneable {
 	protected double[][] features_;
@@ -37,6 +38,9 @@ public class TrainingData implements Serializable, Cloneable {
 				} catch (NumberFormatException ex) {
 					parsedData.get(id)[blobId] = blobs[blobId].hashCode();
 				}
+				if (Double.isNaN(parsedData.get(id)[blobId])) {
+					parsedData.get(id)[blobId] = 0.;
+				}
 			}
 		}
 		features_ = new double[parsedData.size()][blobsInLine - numLabels];
@@ -70,7 +74,6 @@ public class TrainingData implements Serializable, Cloneable {
 		ObjectInputStream ois = new ObjectInputStream(new FileInputStream(filename));
 		TrainingData net = (TrainingData) ois.readObject();
 		ois.close();
-
 		return net;
 	}
 
