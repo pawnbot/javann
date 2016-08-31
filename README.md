@@ -4,7 +4,7 @@ Light weight library with Neural Nets for classification and reinforcement learn
 It supports training data both in CSV and binary format. Look for example in javann/examples/
 
 ```
-TrainingData data = TrainingData.readFromCSV("examples/resources/data.csv");
+        TrainingData data = TrainingData.readFromCSV("examples/resources/data.csv");
         System.out.println("#Examples: " + data.getFeatures().length + ", #Features: " + data.getFeatures()[0].length);
         Bucketizer bucketizer = new Bucketizer();
         bucketizer.enableLogging();
